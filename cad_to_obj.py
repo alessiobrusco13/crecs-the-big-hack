@@ -1,17 +1,23 @@
-INPUT_CAD    = "rotor.stp"   # .step/.stp/.iges/.igs
-OUT_OBJ      = "slim.obj"
-LIN_DEF_MM   = 3.0             # tessellation linear deflection (mm)
-ANG_DEF_RAD  = 0.9             # tessellation angular deflection (radians)
-TARGET_FACES = 7_000          # desired total faces after decimation
-CULL_TINY_MM = 10             # drop parts with bbox diagonal < N mm; or None to disable
+"""Utilities for converting CAD files (STEP/IGES) to OBJ meshes.
 
+The pipeline implemented here performs four stages:
+1. Read and tessellate the CAD geometry via OpenCascade.
+2. Emit a raw OBJ file (millimetres scaled to metres).
+3. Optionally cull tiny connected components to prune noise.
+4. Optionally run mesh decimation via PyMeshLab or Open3D.
+
+The entry point is :func:`convert_cad_to_obj` which coordinates the flow,
+while the CLI in :func:`main` provides an ergonomic wrapper for batch use.
+"""
+
+import argparse
 import math
 import os
 import shutil
 import tempfile
 import time
 from pathlib import Path
-from typing import List, Sequence, Tuple
+from typing import Callable, List, Optional, Sequence, Tuple, TypeVar
 
 import numpy as np
 
@@ -40,12 +46,39 @@ from OCC.Core.STEPControl import STEPControl_Reader
 from OCC.Core.TopAbs import TopAbs_FACE, TopAbs_REVERSED
 from OCC.Core.TopExp import TopExp_Explorer
 from OCC.Core.TopLoc import TopLoc_Location
-from OCC.Core.gp import gp_Pnt
+
+LIN_DEF_MM: float = 3.0
+"""Default tessellation linear deflection (millimetres)."""
+
+ANG_DEF_RAD: float = 0.9
+"""Default tessellation angular deflection (radians)."""
+
+TARGET_FACES: int = 30_000
+"""Desired total number of faces after decimation."""
+
+CULL_TINY_MM: float = 5.0
+"""Maximum bounding-box diagonal (millimetres) for removing components."""
+
+Point3D = Tuple[float, float, float]
+Triangle = Tuple[int, int, int]
+MeshData = Tuple[List[Point3D], List[Triangle]]
+MeshDataLike = Tuple[Sequence[Point3D], Sequence[Triangle]]
+NumberT = TypeVar("NumberT", int, float)
 
 
 def read_shape(cad_path: str):
     """
-    Read a CAD file via the appropriate OpenCascade reader and return a TopoDS_Shape.
+    Load a CAD file and return an OpenCascade shape ready for tessellation.
+
+    Args:
+        cad_path: Path to a STEP (.step/.stp) or IGES (.iges/.igs) file.
+
+    Returns:
+        The deserialized ``TopoDS_Shape`` instance provided by OpenCascade.
+
+    Raises:
+        RuntimeError: If the file is missing, has an unsupported extension,
+            or fails to transfer a valid shape.
     """
     path = Path(cad_path)
     if not path.exists():
@@ -74,9 +107,18 @@ def read_shape(cad_path: str):
     return shape
 
 
-def tessellate(shape, lin_def_mm: float = 3.0, ang_def_rad: float = 0.9) -> None:
+def tessellate(shape, lin_def_mm: float = LIN_DEF_MM, ang_def_rad: float = ANG_DEF_RAD) -> None:
     """
-    Tessellate the shape using OpenCascade's incremental mesher.
+    Tessellate a CAD shape using OpenCascade's incremental mesher.
+
+    Args:
+        shape: OpenCascade ``TopoDS_Shape`` to tessellate in-place.
+        lin_def_mm: Linear deflection parameter expressed in millimetres.
+        ang_def_rad: Angular deflection parameter expressed in radians.
+
+    Raises:
+        RuntimeError: If the tessellation parameters are invalid or
+            the mesher reports failure.
     """
     if lin_def_mm <= 0:
         raise RuntimeError("lin_def_mm must be positive.")
@@ -89,12 +131,21 @@ def tessellate(shape, lin_def_mm: float = 3.0, ang_def_rad: float = 0.9) -> None
         raise RuntimeError("BRepMesh_IncrementalMesh failed to tessellate the shape.")
 
 
-def extract_triangles(shape) -> Tuple[List[Tuple[float, float, float]], List[Tuple[int, int, int]]]:
+def extract_triangles(shape) -> MeshData:
     """
     Extract triangle vertices and face indices from a tessellated shape.
+
+    Args:
+        shape: Tessellated OpenCascade ``TopoDS_Shape`` instance.
+
+    Returns:
+        Tuple of ``(vertices, faces)`` describing the mesh in millimetres.
+
+    Raises:
+        RuntimeError: If no triangles can be extracted from the shape.
     """
-    vertices: List[Tuple[float, float, float]] = []
-    faces: List[Tuple[int, int, int]] = []
+    vertices: List[Point3D] = []
+    faces: List[Triangle] = []
     explorer = TopExp_Explorer(shape, TopAbs_FACE)
 
     while explorer.More():
@@ -172,9 +223,21 @@ def extract_triangles(shape) -> Tuple[List[Tuple[float, float, float]], List[Tup
     return vertices, faces
 
 
-def write_obj(path: str, vertices: Sequence[Tuple[float, float, float]], faces: Sequence[Tuple[int, int, int]], scale: float = 0.001) -> None:
+def write_obj(
+    path: str,
+    vertices: Sequence[Point3D],
+    faces: Sequence[Triangle],
+    scale: float = 0.001,
+) -> None:
     """
-    Write a minimal OBJ (positions + triangle faces) scaling milimeters to meters.
+    Write a minimal OBJ (positions + triangle faces) and apply unit scaling.
+
+    Args:
+        path: Destination OBJ file path.
+        vertices: Iterable of vertex positions expressed in millimetres.
+        faces: Iterable of triangle indices referencing ``vertices``.
+        scale: Factor applied to convert vertices before writing
+            (defaults to millimetres → metres).
     """
     out_path = Path(path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -186,9 +249,17 @@ def write_obj(path: str, vertices: Sequence[Tuple[float, float, float]], faces: 
             obj_file.write(f"f {a + 1} {b + 1} {c + 1}\n")
 
 
-def decimate(inp_path: str, out_path: str, target_faces: int = 80_000) -> str:
+def decimate(inp_path: str, out_path: str, target_faces: Optional[int] = 80_000) -> str:
     """
-    Decimate the mesh using the best available tool, or copy if no decimator is available.
+    Reduce the face count of a mesh using the best available backend.
+
+    Args:
+        inp_path: Source mesh path that should be simplified.
+        out_path: Destination path where the processed mesh is written.
+        target_faces: Desired number of faces; ``None`` or ``<= 0`` disables decimation.
+
+    Returns:
+        Short description of the backend used or why the mesh was copied verbatim.
     """
     source = Path(inp_path)
     destination = Path(out_path)
@@ -251,20 +322,33 @@ def decimate(inp_path: str, out_path: str, target_faces: int = 80_000) -> str:
     return "copy (no decimator)"
 
 
-def cull_tiny_components(obj_in: str, obj_out: str, min_diag_mm: float = 5.0) -> None:
+def cull_tiny_components(obj_in: str, obj_out: str, min_diag_mm: Optional[float] = CULL_TINY_MM) -> None:
     """
-    Remove connected components with a bounding-box diagonal below the threshold (in millimetres).
+    Remove connected components whose bounding-box diagonal falls below ``min_diag_mm``.
+
+    Args:
+        obj_in: Path to the source OBJ file (in metres).
+        obj_out: Destination path where the filtered OBJ will be written.
+        min_diag_mm: Bounding-box diagonal threshold in millimetres.
+            When ``None`` the mesh is copied as-is.
+
+    Raises:
+        RuntimeError: If the OBJ cannot be loaded for processing.
     """
     source = Path(obj_in)
     destination = Path(obj_out)
     destination.parent.mkdir(parents=True, exist_ok=True)
+
+    if min_diag_mm is None:
+        shutil.copy2(source, destination)
+        return
 
     try:
         mesh = trimesh.load(source, force="mesh")
     except Exception as exc:
         raise RuntimeError(f"Failed to load OBJ for culling: {source}") from exc
 
-    if mesh.is_empty or min_diag_mm is None:
+    if mesh.is_empty:
         shutil.copy2(source, destination)
         return
 
@@ -297,9 +381,44 @@ def cull_tiny_components(obj_in: str, obj_out: str, min_diag_mm: float = 5.0) ->
     else:
         shutil.copy2(source, destination)
 
-def convert_cad_to_obj(cad_path: str, out_obj: str, lin_def_mm: float, ang_def_rad: float, target_faces: int, cull_tiny_mm):
+
+def tessellate_to_mesh(cad_path: str, lin_def_mm: float, ang_def_rad: float) -> MeshData:
     """
-    Full pipeline: CAD -> tessellated OBJ -> optional culling -> optional decimation.
+    Read and tessellate a CAD file, returning its triangle mesh.
+
+    Args:
+        cad_path: Path to the CAD file to process.
+        lin_def_mm: Linear deflection in millimetres used for tessellation.
+        ang_def_rad: Angular deflection in radians used for tessellation.
+
+    Returns:
+        Tuple ``(vertices, faces)`` representing the tessellated mesh in millimetres.
+    """
+    shape = read_shape(cad_path)
+    tessellate(shape, lin_def_mm=lin_def_mm, ang_def_rad=ang_def_rad)
+    return extract_triangles(shape)
+
+
+def convert_cad_to_obj(
+    cad_path: str,
+    out_obj: str,
+    lin_def_mm: float,
+    ang_def_rad: float,
+    target_faces: Optional[int],
+    cull_tiny_mm: Optional[float],
+    precomputed_mesh: Optional[MeshDataLike] = None,
+) -> None:
+    """
+    Execute the full CAD → OBJ pipeline including optional post-processing.
+
+    Args:
+        cad_path: Path to the source CAD file.
+        out_obj: Destination path where the final OBJ should be written.
+        lin_def_mm: Linear deflection to use during tessellation (millimetres).
+        ang_def_rad: Angular deflection to use during tessellation (radians).
+        target_faces: Desired number of faces after decimation (``None`` disables).
+        cull_tiny_mm: Bounding-box diagonal threshold in millimetres for component culling.
+        precomputed_mesh: Optional mesh data to reuse instead of tessellating again.
     """
     cad_path = str(cad_path)
     out_obj = str(out_obj)
@@ -307,9 +426,10 @@ def convert_cad_to_obj(cad_path: str, out_obj: str, lin_def_mm: float, ang_def_r
     with tempfile.TemporaryDirectory() as temp_dir:
         temp_dir_path = Path(temp_dir)
 
-        shape = read_shape(cad_path)
-        tessellate(shape, lin_def_mm=lin_def_mm, ang_def_rad=ang_def_rad)
-        vertices, faces = extract_triangles(shape)
+        if precomputed_mesh is None:
+            vertices, faces = tessellate_to_mesh(cad_path, lin_def_mm=lin_def_mm, ang_def_rad=ang_def_rad)
+        else:
+            vertices, faces = precomputed_mesh
 
         raw_obj = temp_dir_path / "tessellated.obj"
         write_obj(raw_obj, vertices, faces, scale=0.001)
@@ -328,8 +448,7 @@ def convert_cad_to_obj(cad_path: str, out_obj: str, lin_def_mm: float, ang_def_r
                 faces_after_cull = len(faces)
 
         decimated_obj = temp_dir_path / "decimated.obj"
-        target_faces_value = None if target_faces is None else int(target_faces)
-        decimator_used = decimate(str(pre_decimation_obj), str(decimated_obj), target_faces=target_faces_value if target_faces_value is not None else None)
+        decimator_used = decimate(str(pre_decimation_obj), str(decimated_obj), target_faces=target_faces)
 
         final_obj_for_export = decimated_obj if decimated_obj.exists() else pre_decimation_obj
 
@@ -356,11 +475,246 @@ def convert_cad_to_obj(cad_path: str, out_obj: str, lin_def_mm: float, ang_def_r
         print(f"Total runtime  : {total_time:.2f} s")
 
 
-convert_cad_to_obj(
-    cad_path=INPUT_CAD,
-    out_obj=OUT_OBJ,
-    lin_def_mm=LIN_DEF_MM,
-    ang_def_rad=ANG_DEF_RAD,
-    target_faces=TARGET_FACES,
-    cull_tiny_mm=CULL_TINY_MM,
-)
+def parse_optional_int_value(value: str) -> Optional[int]:
+    """
+    Parse an optional integer from CLI input, allowing textual 'none' to disable.
+    """
+    stripped = value.strip()
+    if not stripped:
+        return None
+    lowered = stripped.lower()
+    if lowered in {"none", "null", "off", "disable"}:
+        return None
+    return int(stripped)
+
+
+def parse_optional_float_value(value: str) -> Optional[float]:
+    """
+    Parse an optional float from CLI input, allowing textual 'none' to disable.
+    """
+    stripped = value.strip()
+    if not stripped:
+        return None
+    lowered = stripped.lower()
+    if lowered in {"none", "null", "off", "disable"}:
+        return None
+    return float(stripped)
+
+
+def default_output_for(cad_path: str) -> str:
+    """
+    Derive a default OBJ output path next to this script using the CAD file stem.
+
+    Args:
+        cad_path: Path to the CAD file provided by the user.
+
+    Returns:
+        Absolute string path for the suggested OBJ output.
+    """
+    script_dir = Path(__file__).resolve().parent
+    cad_name = Path(cad_path).stem or Path(cad_path).name
+    return str(script_dir / f"{cad_name}.obj")
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    """
+    Construct the argument parser used by the CLI entry point.
+
+    Returns:
+        Configured ``argparse.ArgumentParser`` instance.
+    """
+    parser = argparse.ArgumentParser(
+        description="Convert STEP/IGES CAD files to OBJ meshes with optional decimation."
+    )
+    parser.add_argument("--cad", required=True, help="Path to the input CAD file.")
+    parser.add_argument(
+        "--out",
+        default=None,
+        help="Path to the output OBJ file (defaults to <script_dir>/<input_stem>.obj).",
+    )
+    parser.add_argument(
+        "--lin-def",
+        type=float,
+        default=LIN_DEF_MM,
+        help="Linear deflection for tessellation in millimetres.",
+    )
+    parser.add_argument(
+        "--ang-def",
+        type=float,
+        default=ANG_DEF_RAD,
+        help="Angular deflection for tessellation in radians.",
+    )
+    parser.add_argument(
+        "--target-faces",
+        type=parse_optional_int_value,
+        default=TARGET_FACES,
+        help="Desired face count after decimation (use 'none' to disable).",
+    )
+    parser.add_argument(
+        "--cull-tiny",
+        type=parse_optional_float_value,
+        default=CULL_TINY_MM,
+        help="Cull components with bounding-box diagonal below this threshold in mm (use 'none' to disable).",
+    )
+    parser.add_argument(
+        "--interactive",
+        action="store_true",
+        help="Prompt for parameters after previewing tessellation.",
+    )
+    return parser
+
+
+def prompt_text(prompt: str, default: str) -> str:
+    """
+    Prompt the user for text input, falling back to a default when empty.
+    """
+    response = input(f"{prompt} [{default}]: ").strip()
+    return response or default
+
+
+def prompt_float(prompt: str, default: float) -> float:
+    """
+    Prompt the user for a floating-point value, retrying until valid.
+    """
+    while True:
+        response = input(f"{prompt} [{default}]: ").strip()
+        if not response:
+            return default
+        try:
+            return float(response)
+        except ValueError:
+            print("Please enter a valid number.")
+
+
+def prompt_optional_number(
+    prompt: str,
+    default: Optional[NumberT],
+    caster: Callable[[str], NumberT],
+) -> Optional[NumberT]:
+    """
+    Prompt for an optional numeric value where textual 'none' disables the option.
+
+    Args:
+        prompt: Text shown to the user.
+        default: Value returned when input is empty.
+        caster: Callable converting the non-empty input string to the expected type.
+
+    Returns:
+        Parsed value or ``None`` when the user explicitly disables the option.
+    """
+    display_default = "none" if default is None else str(default)
+    while True:
+        response = input(f"{prompt} [{display_default}]: ").strip()
+        if not response:
+            return default
+        lowered = response.lower()
+        if lowered in {"none", "null", "off", "disable"}:
+            return None
+        try:
+            return caster(response)
+        except ValueError:
+            print("Please enter a valid value or 'none'.")
+
+
+def main() -> None:
+    """CLI entry point that orchestrates argument parsing and pipeline execution."""
+    parser = build_arg_parser()
+    args = parser.parse_args()
+
+    cad_path: str = args.cad
+    out_provided = args.out is not None
+    out_obj = args.out if out_provided else default_output_for(cad_path)
+    lin_def_default = float(args.lin_def)
+    if lin_def_default <= 0:
+        parser.error("--lin-def must be positive.")
+
+    ang_def_default = float(args.ang_def)
+    if not (0 < ang_def_default <= math.pi):
+        parser.error("--ang-def must be in the range (0, pi].")
+
+    target_faces_default = args.target_faces
+    cull_tiny_default = args.cull_tiny
+    if cull_tiny_default is not None and cull_tiny_default <= 0:
+        parser.error("--cull-tiny must be positive or 'none'.")
+
+    preview_mesh = tessellate_to_mesh(cad_path, lin_def_mm=lin_def_default, ang_def_rad=ang_def_default)
+    preview_faces = len(preview_mesh[1])
+    print(f"Preview faces  : {preview_faces:,} (lin_def={lin_def_default} mm, ang_def={ang_def_default} rad)")
+
+    if not args.interactive:
+        convert_cad_to_obj(
+            cad_path=cad_path,
+            out_obj=out_obj,
+            lin_def_mm=lin_def_default,
+            ang_def_rad=ang_def_default,
+            target_faces=target_faces_default,
+            cull_tiny_mm=cull_tiny_default,
+            precomputed_mesh=preview_mesh,
+        )
+        return
+
+    cad_input = prompt_text("Input CAD file", cad_path)
+    cad_path_changed = cad_input != cad_path
+    cad_path = cad_input
+
+    if cad_path_changed:
+        preview_mesh = tessellate_to_mesh(cad_path, lin_def_mm=lin_def_default, ang_def_rad=ang_def_default)
+        preview_faces = len(preview_mesh[1])
+        print(f"Preview faces  : {preview_faces:,} (lin_def={lin_def_default} mm, ang_def={ang_def_default} rad)")
+
+    if not out_provided:
+        out_obj = default_output_for(cad_path)
+    out_obj = prompt_text("Output OBJ file", out_obj)
+
+    while True:
+        lin_def = prompt_float("Linear deflection (mm)", lin_def_default)
+        if lin_def > 0:
+            break
+        print("Linear deflection must be positive.")
+
+    while True:
+        ang_def = prompt_float("Angular deflection (radians)", ang_def_default)
+        if 0 < ang_def <= math.pi:
+            break
+        print("Angular deflection must be within (0, pi].")
+
+    while True:
+        target_faces = prompt_optional_number(
+            "Target face count (enter 'none' to disable)",
+            target_faces_default,
+            int,
+        )
+        if target_faces is None or target_faces > 0:
+            break
+        print("Target face count must be positive or 'none'.")
+
+    while True:
+        cull_tiny = prompt_optional_number(
+            "Cull components below this bounding-box diagonal in mm (enter 'none' to disable)",
+            cull_tiny_default,
+            float,
+        )
+        if cull_tiny is None or cull_tiny > 0:
+            break
+        print("Cull threshold must be positive or 'none'.")
+
+    precomputed_mesh = preview_mesh
+    if not math.isclose(lin_def, lin_def_default) or not math.isclose(ang_def, ang_def_default):
+        precomputed_mesh = tessellate_to_mesh(cad_path, lin_def_mm=lin_def, ang_def_rad=ang_def)
+        print(f"Updated Tessellation: {len(precomputed_mesh[1]):,} faces.")
+    else:
+        print("Reusing preview tessellation for conversion.")
+
+    convert_cad_to_obj(
+        cad_path=cad_path,
+        out_obj=out_obj,
+        lin_def_mm=lin_def,
+        ang_def_rad=ang_def,
+        target_faces=target_faces,
+        cull_tiny_mm=cull_tiny,
+        precomputed_mesh=precomputed_mesh,
+    )
+
+
+if __name__ == "__main__":
+    main()

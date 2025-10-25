@@ -1,109 +1,79 @@
-# CAD → OBJ Pipeline
+# Pipeline CAD → OBJ
 
-Convert STEP/IGES CAD files into lightweight **OBJ** assets ready for Unity/VR.  
-This pipeline uses **pythonOCC** for tessellation, optional **pymeshlab/open3d** for decimation, and **trimesh** for mesh utilities.
-
----
-
-## Features
-- ✅ STEP/IGES input → OBJ output
-- ✅ mm → meters scaling for Unity
-- ✅ Optional tiny-part culling (by bbox diagonal, in mm)
-- ✅ Optional decimation to a target triangle budget
-- ✅ Minimal dependencies; robust fallbacks
+Converti file CAD STEP/IGES in asset **OBJ** leggeri pronti per motori in tempo reale.  
+Il flusso usa **pythonOCC** per la tassellazione, **trimesh** per l'ispezione della mesh e la decimazione opzionale tramite **PyMeshLab** o **Open3D**.
 
 ---
 
-## Requirements
-Install in your conda/mamba env (prefer conda-forge):
+## Installazione
 
+Crea (o attiva) un ambiente Python 3.9+ e installa i pacchetti richiesti.  
+`pythonocc-core`, `trimesh` e `numpy` sono obbligatori; le funzionalità di decimazione diventano disponibili quando `pymeshlab` e/o `open3d` sono installati.
+
+### Conda / Mamba (consigliato)
 ```bash
-mamba install -c conda-forge pythonocc-core trimesh pymeshlab open3d
-# pymeshlab and/or open3d are optional (for decimation)
+mamba install -c conda-forge pythonocc-core trimesh numpy pymeshlab open3d
 ```
 
----
-
-## Quick Start
-1. Put your CAD file (e.g., `1372.stp`) next to the script/notebook.
-2. Set the config values (see below).
-3. Run the notebook cell (or function call) to generate `slim.obj`.
-
----
-
-## Config Parameters
-
-```python
-INPUT_CAD    = "1372.stp"   # .step/.stp/.iges/.igs
-OUT_OBJ      = "slim.obj"
-LIN_DEF_MM   = 3.0          # tessellation linear deflection (mm)
-ANG_DEF_RAD  = 0.9          # tessellation angular deflection (radians)
-TARGET_FACES = 80_000       # desired total faces after decimation
-CULL_TINY_MM = 5.0          # drop parts with bbox diagonal < N mm; or None to disable
+### pip (assicurati che le librerie di sistema OpenCascade siano disponibili)
+```bash
+pip install pythonocc-core trimesh numpy
+pip install pymeshlab open3d  # opzionali, abilitano i backend di decimazione
 ```
 
-### What they do
-- **INPUT_CAD**: Path to your CAD file (STEP/IGES).  
-- **OUT_OBJ**: Output OBJ filename.  
-- **LIN_DEF_MM** *(mm)*: Tessellation coarseness. **Higher** ⇒ fewer triangles (faster/lighter).  
-  - 2.0 (detailed), **3.0 (default)**, 4–5 (lighter for VR)  
-- **ANG_DEF_RAD** *(radians)*: Angular coarseness. **Higher** ⇒ fewer triangles. Typical **0.6–0.9**; **0.9** is coarse & fast.  
-- **TARGET_FACES**: Post-tessellation triangle budget for decimation. If already below, mesh is copied unchanged.  
-  - Standalone VR comfort: **50k–100k** visible triangles.  
-- **CULL_TINY_MM** *(mm)*: Drop connected components with bbox diagonal below this (screws/threads). Set `None` to disable.
+> Se hai bisogno solo della tassellazione senza semplificazione puoi omettere `pymeshlab` e `open3d`.
 
 ---
 
-## Pipeline
-1. **Read CAD** → `TopoDS_Shape` (STEP/IGES).  
-2. **Tessellate** with `BRepMesh_IncrementalMesh` using `LIN_DEF_MM`, `ANG_DEF_RAD`.  
-3. **Extract triangles** via `BRep_Tool.Triangulation(face, TopLoc_Location())` (apply transforms & face orientation).  
-4. **Write OBJ** (positions + faces only), scaled **mm → m**.  
-5. **Cull tiny parts** *(optional)* using `CULL_TINY_MM`.  
-6. **Decimate** *(optional)* to `TARGET_FACES` using **pymeshlab** (preferred) or **open3d**, else copy.  
-7. **Copy final OBJ** to `OUT_OBJ`.
+## Avvio rapido
+```bash
+python cad_to_obj.py --cad path/to/model.step --out path/to/model.obj
+```
+
+- Se ometti `--out` l'OBJ viene salvato accanto allo script usando lo stem del CAD.  
+- Aggiungi `--interactive` per visualizzare un'anteprima della tassellazione e regolare i parametri dal terminale.  
+- Esegui `python cad_to_obj.py --help` per l'elenco completo delle opzioni.
 
 ---
 
-## Core Functions (overview)
-- `read_shape(path)`: Load STEP/IGES and return `TopoDS_Shape`.  
-- `tessellate(shape, lin_def_mm, ang_def_rad)`: OCC meshing; larger values ⇒ coarser mesh.  
-- `extract_triangles(shape) -> (vertices, faces)`: Iterate faces, apply transform/orientation, gather triangles.  
-- `write_obj(path, vertices, faces, scale=0.001)`: Minimal OBJ writer, scales mm→m.  
-- `cull_tiny_components(obj_in, obj_out, min_diag_mm)`: Remove small parts by bbox diagonal.  
-- `decimate(inp_path, out_path, target_faces)`: pymeshlab → open3d → copy.  
-- `convert_cad_to_obj(...)`: Orchestrates the whole pipeline and prints a summary.
+## Modelli di test
+
+La cartella `test_models/` contiene alcuni STEP dimostrativi scaricati da [CADgrab](https://www.cadgrab.com/).  
+Sono inclusi come riferimento per validare rapidamente la pipeline; verifica sempre le condizioni d'uso originali prima di distribuirli.
 
 ---
 
-## Tuning Recipes
-**Too heavy / low FPS**
-- Increase `LIN_DEF_MM` → **4–5**
-- Lower `TARGET_FACES` → **60,000** (or 40–50k)
-- Increase `CULL_TINY_MM` → **10–20**
+## Parametri principali
 
-**Too blocky / detail loss**
-- Decrease `LIN_DEF_MM` → **2.0–2.5**
-- Increase `TARGET_FACES` → **100–150k** (device permitting)
+| Flag | Default | Significato |
+|------|---------|-------------|
+| `--lin-def` | `3.0` mm | Deviazione lineare per la tassellazione (valori maggiori → meno triangoli). |
+| `--ang-def` | `0.9` rad | Deviazione angolare per la tassellazione (valori maggiori → meno triangoli). |
+| `--target-faces` | `500000` | Numero di facce desiderato dopo la decimazione (`none` disattiva). |
+| `--cull-tiny` | `5.0` mm | Rimuove componenti con diagonale del bounding box inferiore a questo (`none` disattiva). |
 
-**Tiny fasteners dominate triangles**
-- Raise `CULL_TINY_MM` → **15 mm** or more
+Questi valori predefiniti corrispondono alle costanti esposte in `cad_to_obj.py`, così i chiamanti programmatici possono riutilizzare `convert_cad_to_obj(...)` senza configurazione.
 
 ---
 
-## Notes
-- Output OBJ is already in **meters**, so Unity scale is correct.  
-- Face orientation is handled; triangle winding stays consistent.  
-- `trimesh` is required; `pymeshlab`/`open3d` are optional for decimation.  
-- If you see SciPy warnings in `trimesh.process`, export still works.
+## Panoramica della pipeline
+1. **Leggi il CAD** → `TopoDS_Shape` tramite i reader OpenCascade.  
+2. **Tassella** con `BRepMesh_IncrementalMesh`.  
+3. **Estrai i triangoli** usando `BRep_Tool.Triangulation(...)`, applicando trasformazioni e orientamento delle facce.  
+4. **Scrivi l'OBJ** (posizioni dei vertici + facce triangolari) scalato **mm → m**.  
+5. **Elimina le parti piccole** *(opzionale)* in base alla diagonale del bounding box.  
+6. **Decima** *(opzionale)* usando PyMeshLab (preferito) → Open3D → copia di fallback.  
+7. **Copia l'OBJ finale** nella destinazione richiesta.
 
 ---
 
-## Example (function call)
+## Utilizzo programmatico
 ```python
+from cad_to_obj import convert_cad_to_obj, LIN_DEF_MM, ANG_DEF_RAD, TARGET_FACES, CULL_TINY_MM
+
 convert_cad_to_obj(
-    cad_path=INPUT_CAD,
-    out_obj=OUT_OBJ,
+    cad_path="part.step",
+    out_obj="part.obj",
     lin_def_mm=LIN_DEF_MM,
     ang_def_rad=ANG_DEF_RAD,
     target_faces=TARGET_FACES,
@@ -113,5 +83,14 @@ convert_cad_to_obj(
 
 ---
 
-## License
-MIT.
+## Note
+- L'OBJ in uscita è già in **metri**, quindi la scala 1 unit = 1 m di Unity/Unreal è mantenuta.  
+- L'orientamento delle facce rimane coerente con le particolarità di OpenCascade.  
+- `trimesh` è obbligatorio; la decimazione retrocede gentilmente alla semplice copia quando gli strumenti opzionali mancano.  
+- Gli avvisi di `trimesh` (ad esempio quelli legati a SciPy) non bloccano l'esportazione.
+
+---
+
+## Licenza
+
+Rilasciato sotto licenza MIT. Il testo completo è disponibile in `LICENSE`.
