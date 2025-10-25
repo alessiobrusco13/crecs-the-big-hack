@@ -1,14 +1,15 @@
-INPUT_CAD    = "1372.stp"   # .step/.stp/.iges/.igs
+INPUT_CAD    = "rotor.stp"   # .step/.stp/.iges/.igs
 OUT_OBJ      = "slim.obj"
 LIN_DEF_MM   = 3.0             # tessellation linear deflection (mm)
 ANG_DEF_RAD  = 0.9             # tessellation angular deflection (radians)
-TARGET_FACES = 10_000          # desired total faces after decimation
+TARGET_FACES = 7_000          # desired total faces after decimation
 CULL_TINY_MM = 10             # drop parts with bbox diagonal < N mm; or None to disable
 
 import math
 import os
 import shutil
 import tempfile
+import time
 from pathlib import Path
 from typing import List, Sequence, Tuple
 
@@ -302,6 +303,7 @@ def convert_cad_to_obj(cad_path: str, out_obj: str, lin_def_mm: float, ang_def_r
     """
     cad_path = str(cad_path)
     out_obj = str(out_obj)
+    start_time = time.perf_counter()
     with tempfile.TemporaryDirectory() as temp_dir:
         temp_dir_path = Path(temp_dir)
 
@@ -350,6 +352,8 @@ def convert_cad_to_obj(cad_path: str, out_obj: str, lin_def_mm: float, ang_def_r
             print(f"After culling  : {faces_after_cull:,} (threshold {cull_tiny_mm} mm)")
         print(f"Final faces    : {final_faces:,} (decimator: {decimator_used})")
         print(f"OBJ written to : {out_obj_path} ({obj_size_mb:.2f} MB)")
+        total_time = time.perf_counter() - start_time
+        print(f"Total runtime  : {total_time:.2f} s")
 
 
 convert_cad_to_obj(
